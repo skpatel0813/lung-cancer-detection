@@ -12,5 +12,5 @@ Human-readable explanation text based on model attention
 
 Evaluation results saved as a CSV report
 
-Option to upload dataset (including images and metadata) to the Hugging Face Hub
-
+Option to upload dataset (including images and metadata) to the Hugging Face Hub:
+https://huggingface.co/datasets/skpatel0813/lung-cancer-predictions/viewer/default/train?row=11&views%5B%5D=train
