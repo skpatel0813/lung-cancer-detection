@@ -30,7 +30,7 @@ Source: [Lung and Colon Cancer Histopathological Images – Kaggle](https://www.
 | F1 Score      | 99.88%    |
 | ROC AUC       | 0.9999    |
 
-Evaluated on a held-out test set of 2,400 images. See `results/predictions.csv` for full per-image results.
+Evaluated on a held-out test set of 2,400 images. See `outputs/predictions.csv` for full per-image results.
 
 ## Explainability
 
