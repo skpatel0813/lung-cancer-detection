@@ -1,40 +1,76 @@
 import os
 import pandas as pd
-from datasets import Dataset, Features, ClassLabel, Value, Image
-from huggingface_hub import HfApi, HfFolder
+from datasets import Dataset, Features, Value, Image as HFImage
+from huggingface_hub import HfApi, create_repo
+import yaml
 
-# --------------- CONFIGURATION ----------------
-HF_TOKEN = "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"
-REPO_ID = "skpatel0813/lung-cancer-predictions"  # ✅ replace with your Hugging Face username/repo
-CSV_PATH = "outputs/predictions.csv"
-HEATMAP_DIR = "outputs/heatmaps"
-# ---------------------------------------------
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
 
-# Step 1: Authenticate
-HfFolder.save_token(HF_TOKEN)
+def create_hf_dataset(df, repo_id, config):
+    """Create and upload dataset with Grad-CAM images and predictions"""
+    df = df.copy()
 
-# Step 2: Load CSV
-df = pd.read_csv(CSV_PATH)
+    # Point the 'image' column to the heatmap image file paths
+    df["image"] = df["heatmap_path"]
 
-# Step 3: Convert heatmap path to full path (for HF Image support)
-df["image"] = df["heatmap_path"].apply(lambda p: os.path.abspath(p))
+    # Define schema matching the CSV exactly
+    features = Features({
+        "image": HFImage(),
+        "true_label": Value("string"),
+        "predicted_label": Value("string"),
+        "confidence": Value("string"),
+        "focus_zone": Value("string"),
+        "heatmap_path": Value("string"),
+        "explanation": Value("string")
+    })
 
-# Step 4: Keep only useful columns
-hf_df = df[["image", "true_label", "predicted_label", "confidence", "explanation"]]
+    # Convert to HF dataset
+    dataset = Dataset.from_pandas(df, features=features)
 
-# Step 5: Define dataset features
-features = Features({
-    "image": Image(),  # Special Hugging Face image column
-    "true_label": Value("string"),
-    "predicted_label": Value("string"),
-    "confidence": Value("string"),
-    "explanation": Value("string"),
-})
+    # Push to Hugging Face Hub
+    dataset.push_to_hub(
+        repo_id=repo_id,
+        split="train",
+        private=config['private'],
+        token=config['hf_token']
+    )
 
-# Step 6: Convert to Hugging Face Dataset
-dataset = Dataset.from_pandas(hf_df, features=features)
+    return dataset
 
-# Step 7: Push to Hugging Face
-dataset.push_to_hub(REPO_ID)
+def main():
+    # Load config
+    config = load_config('configs/huggingface.yaml')
+    api = HfApi()
 
-print(f"✅ Upload complete! View at: https://huggingface.co/datasets/{REPO_ID}")
+    # Attempt to create repo if it doesn't exist
+    try:
+        create_repo(
+            repo_id=config['repo_id'],
+            repo_type="dataset",
+            private=config['private'],
+            token=config['hf_token']
+        )
+    except Exception as e:
+        print(f"[INFO] Repo already exists or could not be created: {e}")
+
+    # Load predictions CSV
+    if not os.path.exists(config['predictions_path']):
+        print(f"[ERROR] Predictions file not found: {config['predictions_path']}")
+        return
+
+    df = pd.read_csv(config['predictions_path'])
+
+    if df.empty:
+        print("[ERROR] CSV is empty.")
+        return
+
+    print("📦 Creating and uploading dataset to Hugging Face...")
+    dataset = create_hf_dataset(df, config['repo_id'], config)
+
+    print(f"\n✅ Upload complete! View it at: https://huggingface.co/datasets/{config['repo_id']}")
+
+if __name__ == "__main__":
+    main()

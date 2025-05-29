@@ -1,131 +1,134 @@
 import os
-import csv
 import torch
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
-from torchvision import datasets, transforms
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-
 from models.cnn_model import LungCancerCNN
+from utils.data_loader import get_loaders
+import argparse
+import yaml
 
-# ------------------ Configuration ------------------
-DATA_PATH = 'data/test'
-OUTPUT_DIR = 'outputs'
-HEATMAP_DIR = os.path.join(OUTPUT_DIR, 'heatmaps')
-CSV_PATH = os.path.join(OUTPUT_DIR, 'predictions.csv')
+def parse_args():
+    parser = argparse.ArgumentParser(description='Evaluate Lung Cancer Detection Model')
+    parser.add_argument('--config', type=str, default='configs/eval.yaml', help='Path to config file')
+    return parser.parse_args()
 
-os.makedirs(HEATMAP_DIR, exist_ok=True)
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
 
-# ------------------ Device ------------------
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+def main():
+    args = parse_args()
+    config = load_config(args.config)
 
-# ------------------ Data Transforms ------------------
-transform = transforms.Compose([
-    transforms.Grayscale(),
-    transforms.Resize((128, 128)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
-])
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ------------------ Load Test Data ------------------
-test_dataset = datasets.ImageFolder(root=DATA_PATH, transform=transform)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-idx_to_class = {v: k for k, v in test_dataset.class_to_idx.items()}
+    # Load model
+    model = LungCancerCNN(num_classes=2).to(device)
+    model.load_state_dict(torch.load(config['model_path'], map_location=device))
+    model.eval()
 
-# ------------------ Load Model ------------------
-model = LungCancerCNN().to(device)
-model.load_state_dict(torch.load('lung_cancer_cnn.pth', map_location=device))
-model.eval()
+    # Get test loader
+    _, _, test_loader = get_loaders(
+        config['data_dir'],
+        batch_size=config['batch_size'],
+        img_size=config['image_size'],
+        num_workers=config['num_workers']
+    )
 
-# ------------------ Grad-CAM Setup ------------------
-target_layer = model.conv3
-cam = GradCAM(model=model, target_layers=[target_layer])  # for compatibility
+    # Grad-CAM setup
+    target_layers = model.get_cam_target_layers()
+    cam = GradCAM(model=model, target_layers=target_layers)
 
-# ------------------ Evaluation Loop ------------------
-all_preds, all_labels = [], []
-rows = []
+    all_preds = []
+    all_probs = []
+    all_labels = []
+    results = []
 
-print("\nEvaluating and generating Grad-CAMs...\n")
+    os.makedirs(config['output_dir'], exist_ok=True)
+    os.makedirs(os.path.join(config['output_dir'], 'heatmaps'), exist_ok=True)
 
-for i, (image_tensor, label_tensor) in enumerate(tqdm(test_loader)):
-    image_tensor = image_tensor.to(device)
-    label = label_tensor.item()
-    path, _ = test_dataset.samples[i]
-    file_name = os.path.basename(path)
+    for batch_idx, (images, labels) in enumerate(tqdm(test_loader, desc="Evaluating")):
+        images = images.to(device)
+        labels = labels.to(device)
 
-    # Model inference
-    output = model(image_tensor)
-    pred_class = torch.argmax(output, 1).item()
-    confidence = torch.softmax(output, dim=1)[0][pred_class].item()
-    prediction_name = idx_to_class[pred_class]
-    true_name = idx_to_class[label]
+        # Forward pass (no gradient)
+        with torch.no_grad():
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
 
-    all_preds.append(pred_class)
-    all_labels.append(label)
+        all_preds.extend(preds.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
 
-    # Raw image for CAM visualization
-    raw_image = Image.open(path).convert("RGB").resize((128, 128))
-    raw_image_np = np.array(raw_image) / 255.0
-    raw_image_np = np.float32(raw_image_np)
+        # Grad-CAM on first batch (requires gradient)
+        if batch_idx == 0:
+            targets = [ClassifierOutputTarget(pred.item()) for pred in preds]
+            grayscale_cams = cam(input_tensor=images, targets=targets)
 
-    # Grad-CAM heatmap
-    grayscale_cam = cam(input_tensor=image_tensor, targets=[ClassifierOutputTarget(pred_class)])[0]
-    cam_image = show_cam_on_image(raw_image_np, grayscale_cam, use_rgb=True)
+            for i, (image, label, pred, prob, cam_img) in enumerate(zip(
+                images.cpu(), labels.cpu(), preds.cpu(), probs.cpu(), grayscale_cams
+            )):
+                rgb_img = image.permute(1, 2, 0).numpy()
+                rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min())
+                heatmap = show_cam_on_image(rgb_img, cam_img, use_rgb=True, image_weight=0.5)
 
-    # Determine most activated region
-    h, w = grayscale_cam.shape
-    max_y, max_x = np.unravel_index(np.argmax(grayscale_cam), grayscale_cam.shape)
-    zone_x = "left" if max_x < w / 3 else "center" if max_x < 2 * w / 3 else "right"
-    zone_y = "upper" if max_y < h / 3 else "middle" if max_y < 2 * h / 3 else "lower"
-    focus_zone = f"{zone_y}-{zone_x} region"
+                img_name = f"sample_{batch_idx}_{i}.png"
+                img_path = os.path.join(config['output_dir'], 'heatmaps', img_name)
+                plt.imsave(img_path, heatmap)
 
-    # Save CAM overlay
-    cam_save_path = os.path.join(HEATMAP_DIR, f"{file_name}_cam.jpg")
-    plt.imsave(cam_save_path, cam_image)
+                results.append({
+                    'image': img_name,
+                    'true_label': test_loader.dataset.classes[label],
+                    'predicted_label': test_loader.dataset.classes[pred],
+                    'confidence': f"{prob[pred]:.4f}",
+                    'heatmap_path': img_path,
+                    'prob_normal': f"{prob[0]:.4f}",
+                    'prob_cancer': f"{prob[1]:.4f}"
+                })
 
-    # ✅ Human-readable explanation (FIXED: label check uses lowercase)
-    if prediction_name.lower() == 'cancer':
-        explanation = (
-            f"The model predicted **Cancer** with high confidence ({confidence:.2f}). "
-            f"Strong visual activation was observed in the {focus_zone}, which may indicate abnormal tissue presence."
-        )
-    else:
-        explanation = (
-            f"The model predicted **Normal** with high confidence ({confidence:.2f}). "
-            f"Model attention was mostly on the {focus_zone}, but no abnormal patterns were identified."
-        )
+    # Metrics
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
 
-    # Console output
-    print(f"{file_name} → Predicted: {prediction_name}, True: {true_name}, Confidence: {confidence:.2f}")
-    print(f"🧠 Explanation: {explanation}\n")
+    # Classification report
+    print("\n=== Classification Report ===")
+    print(classification_report(
+        all_labels, all_preds,
+        target_names=test_loader.dataset.classes,
+        digits=4
+    ))
 
-    # Save to CSV row
-    rows.append({
-        'image': file_name,
-        'true_label': true_name,
-        'predicted_label': prediction_name,
-        'confidence': f"{confidence:.4f}",
-        'focus_zone': focus_zone,
-        'heatmap_path': cam_save_path,
-        'explanation': explanation
-    })
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=test_loader.dataset.classes,
+                yticklabels=test_loader.dataset.classes)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.savefig(os.path.join(config['output_dir'], 'confusion_matrix.png'))
+    plt.close()
 
-# ------------------ Save CSV Report ------------------
-with open(CSV_PATH, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
+    # ROC AUC for cancer (class 1)
+    print("\n=== ROC AUC Score ===")
+    auc = roc_auc_score(all_labels, all_probs[:, 1])
+    print(f"Binary ROC AUC (Cancer): {auc:.4f}")
 
-# ------------------ Print Final Metrics ------------------
-print("\n=== Classification Report ===")
-print(classification_report(all_labels, all_preds, target_names=["Normal", "Cancer"]))
+    # Save predictions
+    df = pd.DataFrame(results)
+    df.to_csv(os.path.join(config['output_dir'], 'predictions.csv'), index=False)
+    print(f"\n✅ Results saved to: {config['output_dir']}")
 
-print("=== Confusion Matrix ===")
-print(confusion_matrix(all_labels, all_preds))
-print(f"\n✅ All results saved to: {OUTPUT_DIR}")
+if __name__ == "__main__":
+    main()
