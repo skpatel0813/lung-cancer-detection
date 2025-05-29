@@ -1,0 +1,5 @@
+# Hugging Face Hub configuration
+hf_token: "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"  # Replace with your actual token
+repo_id: "skpatel0813/lung-cancer-detection"  # Replace with your repo
+private: true
+predictions_path: "outputs/predictions.csv"

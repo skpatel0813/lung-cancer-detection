@@ -1,0 +1,5 @@
+source_dir: "data/train"         # Source with 'cancer' and 'normal'
+dest_dir: "data/split"           # Will create 'train', 'val', 'test' folders here
+test_size: 0.2                   # Test already exists, so skip
+val_size: 0.2                    # 20% of training set for validation
+random_state: 42

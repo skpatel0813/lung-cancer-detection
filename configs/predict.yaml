@@ -1,0 +1,6 @@
+# Prediction configuration
+model_path: "models/best_model.pth"
+image_size: 384
+confidence_threshold: 0.5
+save_visualization: true
+output_dir: "predictions"
